@@ -15,10 +15,9 @@
 #include <linux/irqchip/chained_irq.h>
 #include <linux/of_address.h>
 #include <linux/io.h>
+#include <linux/jump_label.h>
 #include <linux/bug.h>
 #include <linux/of_irq.h>
-
-static struct xintc_irq_chip *primary_intc;
 
 /* No one else should require these constants, so define them locally here. */
 #define ISR 0x00			/* Interrupt Status Register */
@@ -33,40 +32,35 @@ static struct xintc_irq_chip *primary_intc;
 #define MER_ME (1<<0)
 #define MER_HIE (1<<1)
 
+static DEFINE_STATIC_KEY_FALSE(xintc_is_be);
+
 struct xintc_irq_chip {
 	void		__iomem *base;
 	struct		irq_domain *root_domain;
 	u32		intr_mask;
-	struct			irq_chip *intc_dev;
-	u32				nr_irq;
-	unsigned int	(*read_fn)(void __iomem *addr);
-	void			(*write_fn)(void __iomem *addr, u32);
 };
 
-static void xintc_write(void __iomem *addr, u32 data)
+static struct xintc_irq_chip *xintc_irqc;
+
+static void xintc_write(int reg, u32 data)
 {
-		iowrite32(data, addr);
+	if (static_branch_unlikely(&xintc_is_be))
+		iowrite32be(data, xintc_irqc->base + reg);
+	else
+		iowrite32(data, xintc_irqc->base + reg);
 }
 
-static unsigned int xintc_read(void __iomem *addr)
+static unsigned int xintc_read(int reg)
 {
-		return ioread32(addr);
-}
-
-static void xintc_write_be(void __iomem *addr, u32 data)
-{
-		iowrite32be(data, addr);
-}
-
-static unsigned int xintc_read_be(void __iomem *addr)
-{
-		return ioread32be(addr);
+	if (static_branch_unlikely(&xintc_is_be))
+		return ioread32be(xintc_irqc->base + reg);
+	else
+		return ioread32(xintc_irqc->base + reg);
 }
 
 static void intc_enable_or_unmask(struct irq_data *d)
 {
 	unsigned long mask = 1 << d->hwirq;
-	struct xintc_irq_chip *local_intc = irq_data_get_irq_chip_data(d);
 
 	pr_debug("irq-xilinx: enable_or_unmask: %ld\n", d->hwirq);
 
@@ -75,57 +69,47 @@ static void intc_enable_or_unmask(struct irq_data *d)
 	 * acks the irq before calling the interrupt handler
 	 */
 	if (irqd_is_level_type(d))
-		local_intc->write_fn(local_intc->base + IAR, mask);
+		xintc_write(IAR, mask);
 
-	local_intc->write_fn(local_intc->base + SIE, mask);
+	xintc_write(SIE, mask);
 }
 
 static void intc_disable_or_mask(struct irq_data *d)
 {
-	struct xintc_irq_chip *local_intc = irq_data_get_irq_chip_data(d);
-
 	pr_debug("irq-xilinx: disable: %ld\n", d->hwirq);
-	local_intc->write_fn(local_intc->base + CIE, 1 << d->hwirq);
+	xintc_write(CIE, 1 << d->hwirq);
 }
 
 static void intc_ack(struct irq_data *d)
 {
-	struct xintc_irq_chip *local_intc = irq_data_get_irq_chip_data(d);
-
 	pr_debug("irq-xilinx: ack: %ld\n", d->hwirq);
-	local_intc->write_fn(local_intc->base + IAR, 1 << d->hwirq);
+	xintc_write(IAR, 1 << d->hwirq);
 }
 
 static void intc_mask_ack(struct irq_data *d)
 {
 	unsigned long mask = 1 << d->hwirq;
-	struct xintc_irq_chip *local_intc = irq_data_get_irq_chip_data(d);
 
 	pr_debug("irq-xilinx: disable_and_ack: %ld\n", d->hwirq);
-	local_intc->write_fn(local_intc->base + CIE, mask);
-	local_intc->write_fn(local_intc->base + IAR, mask);
+	xintc_write(CIE, mask);
+	xintc_write(IAR, mask);
 }
 
-static unsigned int xintc_get_irq_local(struct xintc_irq_chip *local_intc)
-{
-	int hwirq, irq = -1;
-
-	hwirq = local_intc->read_fn(local_intc->base + IVR);
-	if (hwirq != -1U)
-		irq = irq_find_mapping(local_intc->root_domain, hwirq);
-
-	pr_debug("irq-xilinx: hwirq=%d, irq=%d\n", hwirq, irq);
-
-	return irq;
-}
+static struct irq_chip intc_dev = {
+	.name = "Xilinx INTC",
+	.irq_unmask = intc_enable_or_unmask,
+	.irq_mask = intc_disable_or_mask,
+	.irq_ack = intc_ack,
+	.irq_mask_ack = intc_mask_ack,
+};
 
 unsigned int xintc_get_irq(void)
 {
-	int hwirq, irq = -1;
+	unsigned int hwirq, irq = -1;
 
-	hwirq = primary_intc->read_fn(primary_intc->base + IVR);
+	hwirq = xintc_read(IVR);
 	if (hwirq != -1U)
-		irq = irq_find_mapping(primary_intc->root_domain, hwirq);
+		irq = irq_find_mapping(xintc_irqc->root_domain, hwirq);
 
 	pr_debug("irq-xilinx: hwirq=%d, irq=%d\n", hwirq, irq);
 
@@ -134,18 +118,15 @@ unsigned int xintc_get_irq(void)
 
 static int xintc_map(struct irq_domain *d, unsigned int irq, irq_hw_number_t hw)
 {
-	struct xintc_irq_chip *local_intc = d->host_data;
-
-	if (local_intc->intr_mask & (1 << hw)) {
-		irq_set_chip_and_handler_name(irq, local_intc->intc_dev,
+	if (xintc_irqc->intr_mask & (1 << hw)) {
+		irq_set_chip_and_handler_name(irq, &intc_dev,
 						handle_edge_irq, "edge");
 		irq_clear_status_flags(irq, IRQ_LEVEL);
 	} else {
-		irq_set_chip_and_handler_name(irq, local_intc->intc_dev,
+		irq_set_chip_and_handler_name(irq, &intc_dev,
 						handle_level_irq, "level");
 		irq_set_status_flags(irq, IRQ_LEVEL);
 	}
-	irq_set_chip_data(irq, local_intc);
 	return 0;
 }
 
@@ -157,13 +138,11 @@ static const struct irq_domain_ops xintc_irq_domain_ops = {
 static void xil_intc_irq_handler(struct irq_desc *desc)
 {
 	struct irq_chip *chip = irq_desc_get_chip(desc);
-	struct xintc_irq_chip *local_intc =
-		irq_data_get_irq_handler_data(&desc->irq_data);
 	u32 pending;
 
 	chained_irq_enter(chip, desc);
 	do {
-		pending = xintc_get_irq_local(local_intc);
+		pending = xintc_get_irq();
 		if (pending == -1U)
 			break;
 		generic_handle_irq(pending);
@@ -174,20 +153,28 @@ static void xil_intc_irq_handler(struct irq_desc *desc)
 static int __init xilinx_intc_of_init(struct device_node *intc,
 					     struct device_node *parent)
 {
+	u32 nr_irq;
 	int ret, irq;
 	struct xintc_irq_chip *irqc;
-	struct irq_chip *intc_dev;
+
+	if (xintc_irqc) {
+		pr_err("irq-xilinx: Multiple instances aren't supported\n");
+		return -EINVAL;
+	}
 
 	irqc = kzalloc(sizeof(*irqc), GFP_KERNEL);
 	if (!irqc)
 		return -ENOMEM;
+
+	xintc_irqc = irqc;
+
 	irqc->base = of_iomap(intc, 0);
 	BUG_ON(!irqc->base);
 
-	ret = of_property_read_u32(intc, "xlnx,num-intr-inputs", &irqc->nr_irq);
+	ret = of_property_read_u32(intc, "xlnx,num-intr-inputs", &nr_irq);
 	if (ret < 0) {
 		pr_err("irq-xilinx: unable to read xlnx,num-intr-inputs\n");
-		goto error;
+		goto err_alloc;
 	}
 
 	ret = of_property_read_u32(intc, "xlnx,kind-of-intr", &irqc->intr_mask);
@@ -196,45 +183,30 @@ static int __init xilinx_intc_of_init(struct device_node *intc,
 		irqc->intr_mask = 0;
 	}
 
-	if (irqc->intr_mask >> irqc->nr_irq)
+	if (irqc->intr_mask >> nr_irq)
 		pr_warn("irq-xilinx: mismatch in kind-of-intr param\n");
 
 	pr_info("irq-xilinx: %pOF: num_irq=%d, edge=0x%x\n",
-		intc, irqc->nr_irq, irqc->intr_mask);
+		intc, nr_irq, irqc->intr_mask);
 
-	intc_dev = kzalloc(sizeof(*intc_dev), GFP_KERNEL);
-	if (!intc_dev) {
-		ret = -ENOMEM;
-		goto error;
-	}
 
-	intc_dev->name = intc->full_name;
-	intc_dev->irq_unmask = intc_enable_or_unmask,
-	intc_dev->irq_mask = intc_disable_or_mask,
-	intc_dev->irq_ack = intc_ack,
-	intc_dev->irq_mask_ack = intc_mask_ack,
-	irqc->intc_dev = intc_dev;
-
-	irqc->write_fn = xintc_write;
-	irqc->read_fn = xintc_read;
 	/*
 	 * Disable all external interrupts until they are
 	 * explicity requested.
 	 */
-	irqc->write_fn(irqc->base + IER, 0);
+	xintc_write(IER, 0);
 
 	/* Acknowledge any pending interrupts just in case. */
-	irqc->write_fn(irqc->base + IAR, 0xffffffff);
+	xintc_write(IAR, 0xffffffff);
 
 	/* Turn on the Master Enable. */
-	irqc->write_fn(irqc->base + MER, MER_HIE | MER_ME);
-	if (!(irqc->read_fn(irqc->base + MER) & (MER_HIE | MER_ME))) {
-		irqc->write_fn = xintc_write_be;
-		irqc->read_fn = xintc_read_be;
-		irqc->write_fn(irqc->base + MER, MER_HIE | MER_ME);
+	xintc_write(MER, MER_HIE | MER_ME);
+	if (!(xintc_read(MER) & (MER_HIE | MER_ME))) {
+		static_branch_enable(&xintc_is_be);
+		xintc_write(MER, MER_HIE | MER_ME);
 	}
 
-	irqc->root_domain = irq_domain_add_linear(intc, irqc->nr_irq,
+	irqc->root_domain = irq_domain_add_linear(intc, nr_irq,
 						  &xintc_irq_domain_ops, irqc);
 	if (!irqc->root_domain) {
 		pr_err("irq-xilinx: Unable to create IRQ domain\n");
@@ -253,16 +225,13 @@ static int __init xilinx_intc_of_init(struct device_node *intc,
 			goto err_alloc;
 		}
 	} else {
-		primary_intc = irqc;
-		irq_set_default_host(primary_intc->root_domain);
+		irq_set_default_host(irqc->root_domain);
 	}
 
 	return 0;
 
 err_alloc:
-	kfree(intc_dev);
-error:
-	iounmap(irqc->base);
+	xintc_irqc = NULL;
 	kfree(irqc);
 	return ret;
 
